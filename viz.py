@@ -715,6 +715,65 @@ def plot_intensity_scatter(xy: np.ndarray, z0: float, fit: bool = True, bins: in
     plt.show()
 
 
+def make_intensity_grid_xy(xy: np.ndarray, z0: float,
+                           bins: int = 200,
+                           margin: float = 1.2,
+                           extent_xy: Optional[Tuple[Tuple[float,float], Tuple[float,float]]] = None,
+                           cmap_name: str = 'inferno') -> Tuple[pv.ImageData, str]:
+    """
+    Build a 2D histogram on the plane z=z0 and return a thin ImageData carrying cell-data 'I'.
+    - xy: (M,2) sample points
+    - bins: number of bins along each axis (int or (nx, ny))
+    - margin: scale on auto extents
+    - extent_xy: ((xmin,xmax),(ymin,ymax)) override
+    Returns (grid, scalar_name)
+    """
+    # Helper to create an empty thin image so downstream plotting doesn't crash
+    def _empty_grid():
+        grid = pv.ImageData()
+        grid.dimensions = (2, 2, 2)  # points (=> 1x1x1 cells)
+        grid.origin = (0.0, 0.0, z0 - 1e-6)
+        grid.spacing = (1e-3, 1e-3, 2e-6)
+        grid.cell_data['I'] = np.zeros((1,), dtype=float)
+        return grid, 'I'
+
+    if xy.size == 0:
+        return _empty_grid()
+
+    if isinstance(bins, int):
+        nx = ny = max(8, bins)
+    else:
+        nx, ny = bins
+
+    if extent_xy is None:
+        xmin, xmax = xy[:,0].min(), xy[:,0].max()
+        ymin, ymax = xy[:,1].min(), xy[:,1].max()
+        cx, cy = 0.5*(xmin+xmax), 0.5*(ymin+ymax)
+        sx, sy = (xmax-xmin), (ymax-ymin)
+        sx = sx if sx > 0 else 1e-6
+        sy = sy if sy > 0 else 1e-6
+        halfx = 0.5*margin*sx
+        halfy = 0.5*margin*sy
+        xmin, xmax = cx - halfx, cx + halfx
+        ymin, ymax = cy - halfy, cy + halfy
+    else:
+        (xmin, xmax), (ymin, ymax) = extent_xy
+
+    H, x_edges, y_edges = np.histogram2d(xy[:,0], xy[:,1], bins=[nx, ny], range=[[xmin, xmax], [ymin, ymax]])
+
+    # Build a thin 3D image so we can store cell data
+    grid = pv.ImageData()
+    # ImageData dimensions are number of points; to get (nx,ny,1) cells, set dims=(nx+1, ny+1, 2)
+    grid.dimensions = (nx + 1, ny + 1, 2)
+    dx = (x_edges[-1] - x_edges[0]) / nx
+    dy = (y_edges[-1] - y_edges[0]) / ny
+    grid.origin = (x_edges[0], y_edges[0], z0 - 1e-6)
+    grid.spacing = (dx, dy, 2e-6)
+
+    # VTK expects Fortran-order flatten for cell arrays
+    grid.cell_data['I'] = H.T.ravel(order='F')
+    grid.cell_data.set_active('I')
+    return grid, 'I'
 
 # =========================
 # PyVista helpers
@@ -741,6 +800,9 @@ def add_ray_polyline(plotter: pv.Plotter, path_pts: np.ndarray, line_width: floa
     line = pv.lines_from_points(path_pts, close=False)
     plotter.add_mesh(line, color=color, line_width=line_width)
 
+# Overlay intensity map grid on the plotter (supports ImageData / any DataSet with scalars)
+def add_intensity_plane(plotter: pv.Plotter, grid: pv.DataSet, scalar_name: str = 'I', cmap: str = 'inferno', opacity: float = 0.85):
+    plotter.add_mesh(grid, scalars=scalar_name, cmap=cmap, opacity=opacity, lighting=False, show_edges=False)
 
 # =========================
 # Demo
@@ -752,15 +814,15 @@ def main(mesh_kind: str = "sphere"):
             aperture_radius=100e-3,    # 12.5 mm
             R=160e-3,                    # 50 mm ROC, convex toward +Z
             center_thickness=50e-3,      # 4 mm CT
-            radial_segments=256,
-            azimuth_segments=1024,
+            radial_segments=64,
+            azimuth_segments=256,
             center=(0, 0, 0),
         )
         n_inside = 1.52
         name = "plano_convex"
 
         # --- Gaussian beam parameters ---
-        n_rays      = 200               # how many rays to launch
+        n_rays      = 100               # how many rays to launch
         lam         = 780e-9            # wavelength [m]
         w0          = 40e-3               # waist radius [m]
         waist_z     = -0.10              # waist position along +Z [m]
@@ -809,27 +871,40 @@ def main(mesh_kind: str = "sphere"):
         zplanes_cli = []
 
     if want_scatter and len(zplanes_cli) > 0:
-        try:
-            bins_cli = getattr(_cli_args, 'bins', 0)
-        except Exception:
-            bins_cli = 0
         for z0 in zplanes_cli:
             xy = intersect_paths_with_z(paths, z0)
-            plot_intensity_scatter(xy, z0, fit=fit_on, bins=bins_cli, title_prefix=name)
+            plot_intensity_scatter(xy, z0, fit=fit_on, bins=0, title_prefix=name)
 
     # Convert to PolyData for rendering
     poly = tris_to_polydata(tris)
 
     # Render
     p = pv.Plotter(window_size=(900, 700))
-    # --- Render title ---
-    p.add_title(f"{name} (n={n_inside}) — Gaussian ray bundle", font_size=12)
+    # --- Optional: cross-sectional intensity maps at user-specified z-planes ---
+    try:
+        from __main__ import args as _cli_args  # reuse parsed args if running as script
+        zplanes = getattr(_cli_args, 'zplane', [])
+        bins = getattr(_cli_args, 'bins', 200)
+    except Exception:
+        zplanes = []
+        bins = 200
+
+    title = f"{name} (n={n_inside}) — Gaussian ray bundle"
+    if len(zplanes) > 0:
+        title += f"  |  {len(zplanes)} intensity plane(s)"
+    p.add_title(title, font_size=12)
     p.add_mesh(poly, color="lightblue", opacity=0.35, show_edges=True, lighting=True, smooth_shading=True)
 
     # Add all ray polylines
     for i, pts in enumerate(paths):
         line = pv.lines_from_points(pts, close=False)
         p.add_mesh(line, color="crimson", line_width=2.0, opacity=0.9)
+
+    # --- Optional: overlay intensity heatmaps at z-planes ---
+    for z0 in zplanes:
+        xy = intersect_paths_with_z(paths, z0)
+        grid, sname = make_intensity_grid_xy(xy, z0, bins=bins)
+        add_intensity_plane(p, grid, scalar_name=sname, cmap='inferno', opacity=0.8)
 
     # Optional: mark the launch plane center and a few points
     if 'rays' in locals():
@@ -844,8 +919,8 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="PyVista ray-trace visualization")
     parser.add_argument("--mesh", choices=["sphere", "lens"], default="lens", help="Which mesh to visualize")
-    parser.add_argument("--zplane", type=float, nargs="*", default=[0.2], help="One or more z values at which to compute scatter plots of cross-section intensity")
-    parser.add_argument("--bins", type=int, default=0, help="If >0, also show a faint 2D histogram background in the scatter plot")
+    parser.add_argument("--zplane", type=float, nargs="*", default=[0.2], help="One or more z values at which to compute intensity maps / scatter plots")
+    parser.add_argument("--bins", type=int, default=200, help="Histogram bins per axis for intensity map overlay (PyVista, if used)")
     parser.add_argument("--scatter", action="store_true", default=True, help="Show a separate matplotlib scatter plot at each z-plane")
     parser.add_argument("--no-fit", action="store_true", default=False, help="Disable Gaussian fit/ellipse on the scatter plot")
     args = parser.parse_args()
