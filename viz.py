@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 import pyvista as pv
 import numba as nb
+import matplotlib.pyplot as plt
 
 
 # =========================
@@ -629,60 +630,91 @@ def intersect_paths_with_z(paths: List[np.ndarray], z0: float) -> np.ndarray:
     return np.asarray(pts, dtype=float) if pts else np.empty((0, 2), dtype=float)
 
 
-def make_intensity_grid_xy(xy: np.ndarray, z0: float,
-                           bins: int = 200,
-                           margin: float = 1.2,
-                           extent_xy: Optional[Tuple[Tuple[float,float], Tuple[float,float]]] = None,
-                           cmap_name: str = 'inferno') -> Tuple[pv.UniformGrid, str]:
+# =========================
+# Separate scatter-plot intensity at z-planes (+ optional Gaussian fit)
+# =========================
+
+def _fit_gaussian_from_points(xy: np.ndarray):
     """
-    Build a 2D histogram on the plane z=z0 and return a thin UniformGrid carrying cell-data 'I'.
-    - xy: (M,2) sample points
-    - bins: number of bins along each axis (int or (nx, ny))
-    - margin: scale on auto extents
-    - extent_xy: ((xmin,xmax),(ymin,ymax)) override
-    Returns (grid, scalar_name)
+    Estimate 2D Gaussian parameters from samples xy ~ N(mu, Sigma).
+    Returns dict with keys: mu (2,), Sigma (2x2), eigvals (2,), eigvecs (2x2),
+    sigmas (sqrt eigvals), w (1/e^2 radii = sqrt(2)*sigmas), angle_deg (major-axis rotation).
+    """
+    mu = xy.mean(axis=0)
+    X = xy - mu
+    # sample covariance (MLE: 1/N, unbiased: 1/(N-1)); either is fine here
+    Sigma = (X.T @ X) / max(1, xy.shape[0]-1)
+    # Eigen-decomposition; sort descending by eigenvalue
+    evals, evecs = np.linalg.eigh(Sigma)
+    idx = np.argsort(evals)[::-1]
+    evals = evals[idx]
+    evecs = evecs[:, idx]
+    sigmas = np.sqrt(np.maximum(evals, 0.0))
+    w = np.sqrt(2.0) * sigmas  # 1/e^2 radii
+    # Angle of major axis w.r.t +x
+    angle = np.degrees(np.arctan2(evecs[1, 0], evecs[0, 0]))
+    return {
+        'mu': mu,
+        'Sigma': Sigma,
+        'eigvals': evals,
+        'eigvecs': evecs,
+        'sigmas': sigmas,
+        'w': w,
+        'angle_deg': angle,
+    }
+
+
+def _ellipse_points(mu, axes_w, angle_deg, n=200):
+    """Return ellipse points for the 1/e^2 contour centered at mu with radii axes_w and rotation angle."""
+    t = np.linspace(0, 2*np.pi, n)
+    ca, sa = np.cos(np.radians(angle_deg)), np.sin(np.radians(angle_deg))
+    R = np.array([[ca, -sa], [sa, ca]])
+    pts = (R @ (np.vstack((axes_w[0]*np.cos(t), axes_w[1]*np.sin(t)))))
+    pts = pts.T + mu
+    return pts
+
+
+def plot_intensity_scatter(xy: np.ndarray, z0: float, fit: bool = True, bins: int = 0, title_prefix: str = ""):
+    """Make a separate 2D plot of ray cross-section at z=z0.
+    - xy: (M,2) intersection points
+    - fit: whether to estimate and draw 2D Gaussian 1/e^2 ellipse and report w_x, w_y
+    - bins: if >0, also show a faint 2D histogram as background
     """
     if xy.size == 0:
-        # create an empty tiny grid to avoid plotting errors
-        grid = pv.UniformGrid(dimensions=(2, 2, 2))
-        grid.origin = (0.0, 0.0, z0-1e-6)
-        grid.spacing = (1e-3, 1e-3, 2e-6)
-        grid.cell_data['I'] = np.zeros((1,), dtype=float)
-        return grid, 'I'
+        fig, ax = plt.subplots(figsize=(6, 5))
+        ax.set_title(f"{title_prefix} z={z0:.4g} m — no intersections")
+        ax.set_xlabel('x [m]'); ax.set_ylabel('y [m]')
+        ax.set_aspect('equal', adjustable='box')
+        plt.show()
+        return
 
-    if isinstance(bins, int):
-        nx = ny = max(8, bins)
-    else:
-        nx, ny = bins
+    fig, ax = plt.subplots(figsize=(6.5, 5.5))
+    if bins and bins > 0:
+        # light background heatmap
+        H, xedges, yedges = np.histogram2d(xy[:,0], xy[:,1], bins=bins)
+        ax.imshow(H.T, origin='lower', extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
+                  cmap='Greys', alpha=0.35, aspect='equal', interpolation='nearest')
 
-    if extent_xy is None:
-        xmin, xmax = xy[:,0].min(), xy[:,0].max()
-        ymin, ymax = xy[:,1].min(), xy[:,1].max()
-        cx, cy = 0.5*(xmin+xmax), 0.5*(ymin+ymax)
-        sx, sy = (xmax-xmin), (ymax-ymin)
-        sx = sx if sx > 0 else 1e-6
-        sy = sy if sy > 0 else 1e-6
-        halfx = 0.5*margin*sx
-        halfy = 0.5*margin*sy
-        xmin, xmax = cx - halfx, cx + halfx
-        ymin, ymax = cy - halfy, cy + halfy
-    else:
-        (xmin, xmax), (ymin, ymax) = extent_xy
+    ax.scatter(xy[:,0], xy[:,1], s=6, alpha=0.7)
 
-    H, x_edges, y_edges = np.histogram2d(xy[:,0], xy[:,1], bins=[nx, ny], range=[[xmin, xmax], [ymin, ymax]])
-    # Build a thin 3D grid so we can store cell data
-    grid = pv.UniformGrid()
-    # UniformGrid dimensions are number of points; to get (nx,ny,1) cells, set dims=(nx+1, ny+1, 2)
-    grid.dimensions = (nx + 1, ny + 1, 2)
-    dx = (x_edges[-1] - x_edges[0]) / nx
-    dy = (y_edges[-1] - y_edges[0]) / ny
-    grid.origin = (x_edges[0], y_edges[0], z0 - 1e-6)
-    grid.spacing = (dx, dy, 2e-6)
+    txt = ""
+    if fit:
+        pars = _fit_gaussian_from_points(xy)
+        mu = pars['mu']; w = pars['w']; ang = pars['angle_deg']
+        # 1/e^2 ellipse (I / I0 = e^-2)
+        ell = _ellipse_points(mu, w, ang)
+        ax.plot(ell[:,0], ell[:,1], lw=2)
+        txt = f"μ=({mu[0]:.3g},{mu[1]:.3g})  w=(w_x={w[0]*1e3:.2f} mm, w_y={w[1]*1e3:.2f} mm)  angle={ang:.1f}°"
 
-    # VTK expects Fortran-order flatten for cell arrays
-    grid.cell_data['I'] = H.T.ravel(order='F')
-    grid.cell_data.set_active('I')
-    return grid, 'I'
+    ax.set_title(f"{title_prefix} z={z0:.4g} m  {txt}")
+    ax.set_xlabel('x [m]')
+    ax.set_ylabel('y [m]')
+    ax.set_aspect('equal', adjustable='box')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
 
 # =========================
 # PyVista helpers
@@ -709,9 +741,6 @@ def add_ray_polyline(plotter: pv.Plotter, path_pts: np.ndarray, line_width: floa
     line = pv.lines_from_points(path_pts, close=False)
     plotter.add_mesh(line, color=color, line_width=line_width)
 
-# Overlay intensity map grid on the plotter
-def add_intensity_plane(plotter: pv.Plotter, grid: pv.UniformGrid, scalar_name: str = 'I', cmap: str = 'inferno', opacity: float = 0.85):
-    plotter.add_mesh(grid, scalars=scalar_name, cmap=cmap, opacity=opacity, lighting=False, show_edges=False)
 
 # =========================
 # Demo
@@ -723,15 +752,15 @@ def main(mesh_kind: str = "sphere"):
             aperture_radius=100e-3,    # 12.5 mm
             R=160e-3,                    # 50 mm ROC, convex toward +Z
             center_thickness=50e-3,      # 4 mm CT
-            radial_segments=64,
-            azimuth_segments=256,
+            radial_segments=256,
+            azimuth_segments=1024,
             center=(0, 0, 0),
         )
         n_inside = 1.52
         name = "plano_convex"
 
         # --- Gaussian beam parameters ---
-        n_rays      = 100               # how many rays to launch
+        n_rays      = 200               # how many rays to launch
         lam         = 780e-9            # wavelength [m]
         w0          = 40e-3               # waist radius [m]
         waist_z     = -0.10              # waist position along +Z [m]
@@ -768,36 +797,39 @@ def main(mesh_kind: str = "sphere"):
         path = trace_single_ray(scene, ray, max_bounces=100, max_path_length=max_length)
         paths = [np.asarray(path)]
 
+    # Optional: separate matplotlib scatter plots at z-planes
+    try:
+        from __main__ import args as _cli_args
+        want_scatter = getattr(_cli_args, 'scatter', False)
+        fit_on = not getattr(_cli_args, 'no_fit', False)
+        zplanes_cli = getattr(_cli_args, 'zplane', [])
+    except Exception:
+        want_scatter = False
+        fit_on = True
+        zplanes_cli = []
+
+    if want_scatter and len(zplanes_cli) > 0:
+        try:
+            bins_cli = getattr(_cli_args, 'bins', 0)
+        except Exception:
+            bins_cli = 0
+        for z0 in zplanes_cli:
+            xy = intersect_paths_with_z(paths, z0)
+            plot_intensity_scatter(xy, z0, fit=fit_on, bins=bins_cli, title_prefix=name)
+
     # Convert to PolyData for rendering
     poly = tris_to_polydata(tris)
 
     # Render
     p = pv.Plotter(window_size=(900, 700))
-    # --- Optional: cross-sectional intensity maps at user-specified z-planes ---
-    try:
-        from __main__ import args as _cli_args  # reuse parsed args if running as script
-        zplanes = getattr(_cli_args, 'zplane', [])
-        bins = getattr(_cli_args, 'bins', 200)
-    except Exception:
-        zplanes = []
-        bins = 200
-
-    title = f"{name} (n={n_inside}) — Gaussian ray bundle"
-    if len(zplanes) > 0:
-        title += f"  |  {len(zplanes)} intensity plane(s)"
-    p.add_title(title, font_size=12)
+    # --- Render title ---
+    p.add_title(f"{name} (n={n_inside}) — Gaussian ray bundle", font_size=12)
     p.add_mesh(poly, color="lightblue", opacity=0.35, show_edges=True, lighting=True, smooth_shading=True)
 
     # Add all ray polylines
     for i, pts in enumerate(paths):
         line = pv.lines_from_points(pts, close=False)
         p.add_mesh(line, color="crimson", line_width=2.0, opacity=0.9)
-
-    # --- Optional: overlay intensity heatmaps at z-planes ---
-    for z0 in zplanes:
-        xy = intersect_paths_with_z(paths, z0)
-        grid, sname = make_intensity_grid_xy(xy, z0, bins=bins)
-        add_intensity_plane(p, grid, scalar_name=sname, cmap='inferno', opacity=0.8)
 
     # Optional: mark the launch plane center and a few points
     if 'rays' in locals():
@@ -812,7 +844,9 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="PyVista ray-trace visualization")
     parser.add_argument("--mesh", choices=["sphere", "lens"], default="lens", help="Which mesh to visualize")
-    parser.add_argument("--zplane", type=float, nargs="*", default=[], help="One or more z values at which to compute intensity maps")
-    parser.add_argument("--bins", type=int, default=200, help="Histogram bins per axis for intensity map")
+    parser.add_argument("--zplane", type=float, nargs="*", default=[0.2], help="One or more z values at which to compute scatter plots of cross-section intensity")
+    parser.add_argument("--bins", type=int, default=0, help="If >0, also show a faint 2D histogram background in the scatter plot")
+    parser.add_argument("--scatter", action="store_true", default=True, help="Show a separate matplotlib scatter plot at each z-plane")
+    parser.add_argument("--no-fit", action="store_true", default=False, help="Disable Gaussian fit/ellipse on the scatter plot")
     args = parser.parse_args()
     main(mesh_kind=args.mesh)
